@@ -51,9 +51,9 @@ Auslagerung der Zutaten in eine eigene Swift-Datei (IngredientCatalog.swift). Je
 
 Mehrere Compilerfehler und Warnungen wurden untersucht und behoben. Dazu gehörten Probleme mit ObservableObject, Self, der Typableitung und der Mengenerkennung. Außerdem wurden die SwiftUI-Vorschau und der iPhone-16-Simulator wiederholt getestet.
 **Probleme und Fehleranalyse:**
-- SwiftUI Preview: Der Compiler konnte einen längeren Ausdruck in parseAmount() nicht rechtzeitig überprüfen. Die Funktion wurde aufgeteilt.
-- Gelbe Code-Markierungen: Standardwerte in Funktionsparametern wurden vereinfacht und teilweise in die Funktionen selbst verlagert.
-- Weißer Simulator-Bildschirm: Zunächst wurde ein Fehler beim Laden der Startansicht vermutet. Nach längerer Ladezeit startete die App jedoch erfolgreich. Es handelte sich somit nicht um einen dauerhaft fehlerhaften Startbildschirm.
+_SwiftUI Preview: Der Compiler konnte einen längeren Ausdruck in parseAmount() nicht rechtzeitig überprüfen. Die Funktion wurde aufgeteilt.
+_Gelbe Code-Markierungen: Standardwerte in Funktionsparametern wurden vereinfacht und teilweise in die Funktionen selbst verlagert.
+_Weißer Simulator-Bildschirm: Zunächst wurde ein Fehler beim Laden der Startansicht vermutet. Nach längerer Ladezeit startete die App jedoch erfolgreich. Es handelte sich somit nicht um einen dauerhaft fehlerhaften Startbildschirm.
 
 **Datenspeicherung**
 
