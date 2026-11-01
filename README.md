@@ -115,5 +115,8 @@ RecipeBook/
 │   └── ImageStorageService.swift
 └── Assets.xcassets
 
+### Nächste Schritte
 
-
+_Datenbank für Zutaten erstellen/erweitern
+_Test Zwischenstand auf iPhone
+_Code durchgehen und schauen wo manuell Änderungen machbar (z.B Farbe, Design, etc.)
