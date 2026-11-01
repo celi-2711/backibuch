@@ -20,23 +20,120 @@ struct RezeptApp: App {
 
 // MARK: - Models
 
-/// A recipe ingredient is stored as structured data instead of a plain string.
-/// This allows the app to remember amount, unit and the selected color.
+/// A recipe ingredient stores measured quantity, unit and an optional modifier separately.
+/// The custom decoder also migrates ingredients saved by earlier app versions.
 struct RecipeIngredient: Identifiable, Codable, Equatable {
     var id: UUID
     var name: String
-    var amount: String
+    var quantity: String
+    var unit: String
+    var modifier: String
     var colorIndex: Int
 
-    init(id: UUID = UUID(), name: String, amount: String = "", colorIndex: Int = 1) {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        quantity: String = "",
+        unit: String = "",
+        modifier: String = "",
+        colorIndex: Int = 7
+    ) {
         self.id = id
         self.name = name
-        self.amount = amount
+        self.quantity = quantity
+        self.unit = unit
+        self.modifier = modifier
         self.colorIndex = colorIndex
     }
 
+    /// Combined amount remains available for search and compatibility with existing UI code.
+    var amount: String {
+        [quantity, unit].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    /// Format shown on recipe ingredient pills, e.g. "450 g  Mehl, Type 405".
     var displayText: String {
-        amount.isEmpty ? name : "\(amount)  \(name)"
+        let amountText = amount
+        let baseText = amountText.isEmpty ? name : "\(amountText)  \(name)"
+        return modifier.isEmpty ? baseText : "\(baseText), \(modifier)"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, quantity, unit, modifier, amount, colorIndex
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "Zutat"
+        modifier = try container.decodeIfPresent(String.self, forKey: .modifier) ?? ""
+        // Missing color values from older saves now default to white (no custom color).
+        colorIndex = try container.decodeIfPresent(Int.self, forKey: .colorIndex) ?? 7
+
+        if let savedQuantity = try container.decodeIfPresent(String.self, forKey: .quantity) {
+            quantity = savedQuantity
+            unit = try container.decodeIfPresent(String.self, forKey: .unit) ?? ""
+        } else {
+            let legacyAmount = try container.decodeIfPresent(String.self, forKey: .amount) ?? ""
+            let parsed = Self.parseLegacyAmount(legacyAmount, ingredientName: name)
+            quantity = parsed.quantity
+            unit = parsed.unit
+            if modifier.isEmpty {
+                modifier = parsed.modifier
+            }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(quantity, forKey: .quantity)
+        try container.encode(unit, forKey: .unit)
+        try container.encode(modifier, forKey: .modifier)
+        try container.encode(colorIndex, forKey: .colorIndex)
+    }
+
+    private static func parseLegacyAmount(
+        _ value: String,
+        ingredientName: String
+    ) -> (quantity: String, unit: String, modifier: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return ("", "", "") }
+
+        let normalized = trimmed.lowercased()
+        if ingredientName.localizedCaseInsensitiveCompare("Mehl") == .orderedSame,
+           normalized.hasPrefix("t ") {
+            let typeValue = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+            return ("", "", "T \(typeValue)")
+        }
+
+        let legacyUnits: [String] = ["stck", "stück", "prise", "msp", "pck", "kg", "ml", "el", "tl", "g", "l"]
+        for unit in legacyUnits {
+            let suffix = " " + unit
+            if normalized.hasSuffix(suffix) {
+                let quantityLength = trimmed.count - suffix.count
+                guard quantityLength >= 0 else { continue }
+                let splitIndex = trimmed.index(trimmed.startIndex, offsetBy: quantityLength)
+                let parsedQuantity = String(trimmed[..<splitIndex])
+                let displayUnit = Self.canonicalUnit(unit)
+                return (parsedQuantity, displayUnit, "")
+            }
+        }
+
+        return (trimmed, "", "")
+    }
+
+    private static func canonicalUnit(_ unit: String) -> String {
+        switch unit {
+        case "el": return "EL"
+        case "tl": return "TL"
+        case "msp": return "Msp"
+        case "stck", "stück": return "Stück"
+        case "pck": return "Pck"
+        case "prise": return "Prise"
+        default: return unit
+        }
     }
 }
 
@@ -110,13 +207,52 @@ final class RecipeStore: ObservableObject {
         didSet { save(categories, forKey: Self.categoriesKey) }
     }
 
+    @Published var categoryColors: [String: Int] = [:] {
+        didSet { save(categoryColors, forKey: Self.categoryColorsKey) }
+    }
+
+    /// Explicit recipe membership supports assigning one recipe to multiple categories.
+    /// A missing key means the legacy Recipe.category property is used as fallback.
+    @Published var categoryRecipeIDs: [String: [UUID]] = [:] {
+        didSet { save(categoryRecipeIDs, forKey: Self.categoryRecipeIDsKey) }
+    }
+
     @Published var ingredientCatalog: [String] = RecipeStore.defaultIngredients {
         didSet { save(ingredientCatalog, forKey: Self.ingredientsKey) }
+    }
+
+    @Published var ingredientModifiers: [String: [String]] = [:] {
+        didSet { save(ingredientModifiers, forKey: Self.ingredientModifiersKey) }
+    }
+
+    @Published var ingredientQuantities: [String: [String]] = [:] {
+        didSet { save(ingredientQuantities, forKey: Self.ingredientQuantitiesKey) }
+    }
+
+    @Published var ingredientUnits: [String: [String]] = [:] {
+        didSet { save(ingredientUnits, forKey: Self.ingredientUnitsKey) }
+    }
+
+    @Published var ingredientColors: [String: Int] = [:] {
+        didSet { save(ingredientColors, forKey: Self.ingredientColorsKey) }
+    }
+
+    /// Built-in ingredients removed in the app are hidden on subsequent launches too.
+    @Published var hiddenDefaultIngredients: [String] = [] {
+        didSet { save(hiddenDefaultIngredients, forKey: Self.hiddenDefaultIngredientsKey) }
     }
 
     private static let recipesKey = "rezeptapp.recipes.v1"
     private static let categoriesKey = "rezeptapp.categories.v1"
     private static let ingredientsKey = "rezeptapp.ingredientCatalog.v1"
+    private static let categoryColorsKey = "rezeptapp.categoryColors.v1"
+    private static let categoryRecipeIDsKey = "rezeptapp.categoryRecipeIDs.v1"
+    private static let ingredientModifiersKey = "rezeptapp.ingredientModifiers.v1"
+    private static let ingredientQuantitiesKey = "rezeptapp.ingredientQuantities.v1"
+    private static let ingredientUnitsKey = "rezeptapp.ingredientUnits.v1"
+    private static let ingredientColorsKey = "rezeptapp.ingredientColors.v1"
+    private static let hiddenDefaultIngredientsKey = "rezeptapp.hiddenDefaultIngredients.v1"
+    private static let codeDefinedIngredientNamesKey = "rezeptapp.codeDefinedIngredientNames.v1"
 
     static let defaultCategories = [
         "Hefeteig", "Rührkuchen", "Tarte", "Muffins", "Kekse", "Torten",
@@ -124,14 +260,20 @@ final class RecipeStore: ObservableObject {
         "Blätterteig", "Pralinen", "Sonstiges"
     ]
 
-    static let defaultIngredients = [
-        "Mehl", "Zucker", "Butter", "Ei", "Milch", "Salz", "Zimt",
-        "Vanillezucker", "Wasser", "brauner Zucker", "Apfel", "Zitronensaft",
-        "Vanille", "Blaubeeren", "Hefe", "Puderzucker", "Mandeln", "Zartbitter",
-        "Vollmilch", "Saft", "Sahne", "Mascarpone", "Joghurt", "Magerquark",
-        "Himbeeren", "Buttermilch", "Eigelb", "Espresso", "Nougat", "Haferkekse",
-        "Marmelade", "Biskuit"
-    ]
+    static let defaultIngredients = IngredientCatalog.definitions.map { $0.name }
+
+    /// Namen aus der älteren fest eingebauten Liste. Beim Laden werden diese
+    /// alten Einträge durch die aktuelle IngredientCatalog.swift ersetzt.
+    // Bereits normalisierte Namen vermeiden eine komplexe .map()-Typinferenz
+    // an dieser Stelle (Swift Preview Compiler).
+    private static let legacyBuiltInIngredientNames: Set<String> = Set<String>([
+        "mehl", "zucker", "butter", "ei", "milch", "salz", "zimt",
+        "vanillezucker", "wasser", "brauner zucker", "apfel", "zitronensaft",
+        "vanille", "blaubeeren", "hefe", "puderzucker", "mandeln", "zartbitter",
+        "vollmilch", "saft", "sahne", "mascarpone", "joghurt", "magerquark",
+        "himbeeren", "buttermilch", "eigelb", "espresso", "nougat", "haferkekse",
+        "marmelade", "biskuit"
+    ])
 
     init() {
         if let data = UserDefaults.standard.data(forKey: Self.recipesKey),
@@ -145,38 +287,340 @@ final class RecipeStore: ObservableObject {
             categories = savedCategories
         }
 
+        if let data = UserDefaults.standard.data(forKey: Self.hiddenDefaultIngredientsKey),
+           let hiddenNames = try? JSONDecoder().decode([String].self, from: data) {
+            hiddenDefaultIngredients = hiddenNames
+        }
+
+        var hiddenNames: Set<String> = []
+        for hiddenName in hiddenDefaultIngredients {
+            hiddenNames.insert(hiddenName.lowercased())
+        }
+
+        // Auch selbst im Code ergänzte Definitionen werden als solche erkannt.
+        // So kann später ihr Name geändert oder eine Definition entfernt werden,
+        // ohne dass der alte gespeicherte Name als benutzerdefinierte Zutat bleibt.
+        var previouslyCodeDefinedNames = Self.legacyBuiltInIngredientNames
+        if let data = UserDefaults.standard.data(forKey: Self.codeDefinedIngredientNamesKey),
+           let savedNames = try? JSONDecoder().decode([String].self, from: data) {
+            for savedName in savedNames {
+                previouslyCodeDefinedNames.insert(savedName.lowercased())
+            }
+        }
+
         if let data = UserDefaults.standard.data(forKey: Self.ingredientsKey),
-           let savedIngredients = try? JSONDecoder().decode([String].self, from: data),
-           !savedIngredients.isEmpty {
-            ingredientCatalog = savedIngredients
+           let savedIngredients = try? JSONDecoder().decode([String].self, from: data) {
+            var mergedIngredients = IngredientCatalog.definitions
+                .map { $0.name }
+                .filter { !hiddenNames.contains($0.lowercased()) }
+
+            let savedCustomIngredients = savedIngredients.filter { savedName in
+                let normalized = savedName.lowercased()
+                return !previouslyCodeDefinedNames.contains(normalized)
+                    && !hiddenNames.contains(normalized)
+            }
+
+            for savedName in savedCustomIngredients {
+                let alreadyExists = mergedIngredients.contains {
+                    $0.localizedCaseInsensitiveCompare(savedName) == .orderedSame
+                }
+                if !alreadyExists {
+                    mergedIngredients.append(savedName)
+                }
+            }
+            ingredientCatalog = mergedIngredients
+        } else {
+            ingredientCatalog = IngredientCatalog.definitions
+                .map { $0.name }
+                .filter { !hiddenNames.contains($0.lowercased()) }
+        }
+
+        if let encodedNames = try? JSONEncoder().encode(IngredientCatalog.definitions.map { $0.name }) {
+            UserDefaults.standard.set(encodedNames, forKey: Self.codeDefinedIngredientNamesKey)
+        }
+
+        if let data = UserDefaults.standard.data(forKey: Self.categoryColorsKey),
+           let savedColors = try? JSONDecoder().decode([String: Int].self, from: data) {
+            categoryColors = savedColors
+        }
+
+        if let data = UserDefaults.standard.data(forKey: Self.categoryRecipeIDsKey),
+           let savedIDs = try? JSONDecoder().decode([String: [UUID]].self, from: data) {
+            categoryRecipeIDs = savedIDs
+        }
+
+        if let data = UserDefaults.standard.data(forKey: Self.ingredientModifiersKey),
+           let savedModifiers = try? JSONDecoder().decode([String: [String]].self, from: data) {
+            ingredientModifiers = savedModifiers
+        }
+
+        if let data = UserDefaults.standard.data(forKey: Self.ingredientQuantitiesKey),
+           let savedQuantities = try? JSONDecoder().decode([String: [String]].self, from: data) {
+            ingredientQuantities = savedQuantities
+        }
+
+        if let data = UserDefaults.standard.data(forKey: Self.ingredientUnitsKey),
+           let savedUnits = try? JSONDecoder().decode([String: [String]].self, from: data) {
+            ingredientUnits = savedUnits
+        }
+
+        if let data = UserDefaults.standard.data(forKey: Self.ingredientColorsKey),
+           let savedColors = try? JSONDecoder().decode([String: Int].self, from: data) {
+            ingredientColors = savedColors
         }
     }
 
+    // MARK: Recipes
+
     func addRecipe(_ recipe: Recipe) {
         recipes.insert(recipe, at: 0)
+        guard categories.contains(recipe.category) else { return }
+        var ids = recipeIDs(forCategory: recipe.category)
+        ids.insert(recipe.id)
+        categoryRecipeIDs[recipe.category] = Array(ids)
     }
 
     func updateRecipe(_ recipe: Recipe) {
         guard let index = recipes.firstIndex(where: { $0.id == recipe.id }) else { return }
+        let oldCategory = recipes[index].category
         recipes[index] = recipe
+
+        if oldCategory != recipe.category {
+            if categories.contains(oldCategory) {
+                var oldIDs = recipeIDs(forCategory: oldCategory)
+                oldIDs.remove(recipe.id)
+                categoryRecipeIDs[oldCategory] = Array(oldIDs)
+            }
+            if categories.contains(recipe.category) {
+                var newIDs = recipeIDs(forCategory: recipe.category)
+                newIDs.insert(recipe.id)
+                categoryRecipeIDs[recipe.category] = Array(newIDs)
+            }
+        } else if categories.contains(recipe.category), categoryRecipeIDs[recipe.category] != nil {
+            var ids = recipeIDs(forCategory: recipe.category)
+            ids.insert(recipe.id)
+            categoryRecipeIDs[recipe.category] = Array(ids)
+        }
     }
 
-    func addCategory(_ name: String) {
+    func deleteRecipe(id: UUID) {
+        recipes.removeAll { $0.id == id }
+        var updatedMemberships = categoryRecipeIDs
+        for name in Array(updatedMemberships.keys) {
+            updatedMemberships[name]?.removeAll { $0 == id }
+        }
+        categoryRecipeIDs = updatedMemberships
+    }
+
+    // MARK: Categories
+
+    func categoryColorIndex(for name: String) -> Int {
+        categoryColors[name] ?? AppStyle.whiteColorIndex
+    }
+
+    func recipeIDs(forCategory name: String) -> Set<UUID> {
+        if let storedIDs = categoryRecipeIDs[name] {
+            return Set(storedIDs)
+        }
+        return Set(recipes.filter { $0.category == name }.map(\.id))
+    }
+
+    func recipes(inCategory name: String) -> [Recipe] {
+        let ids = recipeIDs(forCategory: name)
+        return recipes.filter { ids.contains($0.id) }
+    }
+
+    func categories(forRecipeID id: UUID) -> [String] {
+        let matching = categories.filter { recipeIDs(forCategory: $0).contains(id) }
+        if !matching.isEmpty { return matching }
+
+        guard let recipe = recipes.first(where: { $0.id == id }) else { return [] }
+        // Do not display a legacy primary category after it has been explicitly unassigned.
+        if categoryRecipeIDs[recipe.category] != nil { return [] }
+        return categories.contains(recipe.category) ? [recipe.category] : []
+    }
+
+    func addCategory(_ name: String, colorIndex: Int = 7, recipeIDs: Set<UUID> = []) { // 7 = Weiß / keine Farbe
         let cleanedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanedName.isEmpty else { return }
         guard !categories.contains(where: {
             $0.localizedCaseInsensitiveCompare(cleanedName) == .orderedSame
         }) else { return }
+
         categories.append(cleanedName)
+        categoryColors[cleanedName] = colorIndex
+        categoryRecipeIDs[cleanedName] = Array(recipeIDs)
     }
 
-    func addIngredient(_ name: String) {
+    func updateCategory(
+        oldName: String,
+        newName: String,
+        colorIndex: Int,
+        recipeIDs: Set<UUID>
+    ) -> Bool {
+        let cleanedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedName.isEmpty else { return false }
+        let duplicateExists = categories.contains {
+            $0 != oldName && $0.localizedCaseInsensitiveCompare(cleanedName) == .orderedSame
+        }
+        guard !duplicateExists, let categoryIndex = categories.firstIndex(of: oldName) else {
+            return false
+        }
+
+        categories[categoryIndex] = cleanedName
+        categoryColors.removeValue(forKey: oldName)
+        categoryColors[cleanedName] = colorIndex
+        categoryRecipeIDs.removeValue(forKey: oldName)
+        categoryRecipeIDs[cleanedName] = Array(recipeIDs)
+
+        if oldName != cleanedName {
+            let fallbackCategory = categories.first(where: { $0 != cleanedName }) ?? "Sonstiges"
+            var updatedRecipes = recipes
+            for index in updatedRecipes.indices where updatedRecipes[index].category == oldName {
+                updatedRecipes[index].category = recipeIDs.contains(updatedRecipes[index].id)
+                    ? cleanedName
+                    : fallbackCategory
+            }
+            recipes = updatedRecipes
+        }
+        return true
+    }
+
+    func deleteCategory(_ name: String) {
+        categories.removeAll { $0 == name }
+        categoryColors.removeValue(forKey: name)
+        categoryRecipeIDs.removeValue(forKey: name)
+
+        let fallback = categories.first ?? "Sonstiges"
+        var updatedRecipes = recipes
+        var movedRecipeIDs: Set<UUID> = []
+        for index in updatedRecipes.indices where updatedRecipes[index].category == name {
+            updatedRecipes[index].category = fallback
+            movedRecipeIDs.insert(updatedRecipes[index].id)
+        }
+        recipes = updatedRecipes
+        if categoryRecipeIDs[fallback] != nil {
+            var fallbackIDs = recipeIDs(forCategory: fallback)
+            fallbackIDs.formUnion(movedRecipeIDs)
+            categoryRecipeIDs[fallback] = Array(fallbackIDs)
+        }
+    }
+
+    func setRecipeIDs(_ ids: Set<UUID>, forCategory name: String) {
+        guard categories.contains(name) else { return }
+        categoryRecipeIDs[name] = Array(ids)
+    }
+
+    // MARK: Ingredient catalog
+
+    func ingredientColorIndex(for name: String) -> Int {
+        ingredientColors[name] ?? AppStyle.whiteColorIndex
+    }
+
+    func quantitySuggestions(forIngredient name: String) -> [String] {
+        ingredientQuantities[name] ??
+            IngredientCatalog.definition(for: name)?.quantitySuggestions ??
+            IngredientCatalog.fallbackQuantitySuggestions
+    }
+
+    func unitSuggestions(forIngredient name: String) -> [String] {
+        ingredientUnits[name] ??
+            IngredientCatalog.definition(for: name)?.unitSuggestions ??
+            IngredientCatalog.fallbackUnitSuggestions
+    }
+
+    func modifiers(forIngredient name: String) -> [String] {
+        ingredientModifiers[name] ??
+            IngredientCatalog.definition(for: name)?.modifierSuggestions ?? []
+    }
+
+    func addIngredient(
+        _ name: String,
+        quantitySuggestions: [String]? = nil,
+        unitSuggestions: [String]? = nil,
+        modifiers: [String] = [],
+        colorIndex: Int = 7 // Weiß / keine Farbe
+    ) {
         let cleanedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanedName.isEmpty else { return }
         guard !ingredientCatalog.contains(where: {
             $0.localizedCaseInsensitiveCompare(cleanedName) == .orderedSame
         }) else { return }
         ingredientCatalog.append(cleanedName)
+        // Datenbank-Vorschläge erst hier auflösen, nicht in den Default-Parametern.
+        let resolvedQuantities: [String] = quantitySuggestions ?? IngredientCatalog.fallbackQuantitySuggestions
+        let resolvedUnits: [String] = unitSuggestions ?? IngredientCatalog.fallbackUnitSuggestions
+        ingredientQuantities[cleanedName] = resolvedQuantities
+        ingredientUnits[cleanedName] = resolvedUnits
+        ingredientModifiers[cleanedName] = modifiers
+        ingredientColors[cleanedName] = colorIndex
+    }
+
+    func updateIngredient(
+        oldName: String,
+        newName: String,
+        quantitySuggestions: [String],
+        unitSuggestions: [String],
+        modifiers: [String],
+        colorIndex: Int
+    ) -> Bool {
+        let cleanedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedName.isEmpty else { return false }
+        let duplicateExists = ingredientCatalog.contains {
+            $0 != oldName && $0.localizedCaseInsensitiveCompare(cleanedName) == .orderedSame
+        }
+        guard !duplicateExists, let ingredientIndex = ingredientCatalog.firstIndex(of: oldName) else {
+            return false
+        }
+
+        ingredientCatalog[ingredientIndex] = cleanedName
+
+        if oldName != cleanedName,
+           IngredientCatalog.definition(for: oldName) != nil,
+           !hiddenDefaultIngredients.contains(where: {
+               $0.localizedCaseInsensitiveCompare(oldName) == .orderedSame
+           }) {
+            hiddenDefaultIngredients.append(oldName)
+        }
+
+        ingredientModifiers.removeValue(forKey: oldName)
+        ingredientModifiers[cleanedName] = modifiers
+        ingredientQuantities.removeValue(forKey: oldName)
+        ingredientQuantities[cleanedName] = quantitySuggestions
+        ingredientUnits.removeValue(forKey: oldName)
+        ingredientUnits[cleanedName] = unitSuggestions
+        ingredientColors.removeValue(forKey: oldName)
+        ingredientColors[cleanedName] = colorIndex
+
+        if oldName != cleanedName {
+            var updatedRecipes = recipes
+            for recipeIndex in updatedRecipes.indices {
+                for ingredientIndex in updatedRecipes[recipeIndex].ingredients.indices {
+                    if updatedRecipes[recipeIndex].ingredients[ingredientIndex].name == oldName {
+                        updatedRecipes[recipeIndex].ingredients[ingredientIndex].name = cleanedName
+                    }
+                }
+            }
+            recipes = updatedRecipes
+        }
+        return true
+    }
+
+    func deleteIngredient(_ name: String) {
+        ingredientCatalog.removeAll {
+            $0.localizedCaseInsensitiveCompare(name) == .orderedSame
+        }
+        if IngredientCatalog.definition(for: name) != nil,
+           !hiddenDefaultIngredients.contains(where: {
+               $0.localizedCaseInsensitiveCompare(name) == .orderedSame
+           }) {
+            hiddenDefaultIngredients.append(name)
+        }
+        ingredientModifiers.removeValue(forKey: name)
+        ingredientQuantities.removeValue(forKey: name)
+        ingredientUnits.removeValue(forKey: name)
+        ingredientColors.removeValue(forKey: name)
+        // Ingredients already used in recipes are intentionally kept there.
     }
 
     private func save<T: Encodable>(_ value: T, forKey key: String) {
@@ -193,6 +637,8 @@ private enum AppStyle {
     static let line = Color.black.opacity(0.62)
     static let horizontalPadding: CGFloat = 20
 
+    // Only explicit colors are listed here. White is the default state and
+    // is represented by whiteColorIndex instead of an extra selectable swatch.
     static let ingredientColors: [Color] = [
         Color(red: 1.00, green: 0.70, blue: 0.29), // orange
         Color(red: 1.00, green: 0.94, blue: 0.58), // yellow
@@ -203,8 +649,12 @@ private enum AppStyle {
         Color(red: 1.00, green: 0.32, blue: 0.37)  // red
     ]
 
+    // Keep 7 as the no-color value so previously saved recipes remain compatible.
+    static let whiteColorIndex = 7
+
     static func color(for index: Int) -> Color {
-        ingredientColors[index % ingredientColors.count]
+        guard ingredientColors.indices.contains(index) else { return .white }
+        return ingredientColors[index]
     }
 
     static func pillText() -> Font {
@@ -293,6 +743,7 @@ struct SearchField: View {
 struct OutlinePill: View {
     let title: String
     var filled: Bool = false
+    var fillColor: Color? = nil
 
     var body: some View {
         Text(title)
@@ -300,7 +751,7 @@ struct OutlinePill: View {
             .foregroundStyle(.black)
             .padding(.horizontal, 19)
             .padding(.vertical, 10)
-            .background(filled ? AppStyle.orange : .white, in: Capsule())
+            .background(fillColor ?? (filled ? AppStyle.orange : .white), in: Capsule())
             .overlay(Capsule().stroke(AppStyle.line, lineWidth: 0.8))
             .fixedSize(horizontal: true, vertical: false)
     }
@@ -421,26 +872,31 @@ struct IngredientColorPicker: View {
     @Binding var selectedIndex: Int
 
     var body: some View {
-        HStack(spacing: 12) {
+        // Equal-width slots keep all seven swatches inside the available content
+        // width, including on smaller devices and inside sheet presentations.
+        HStack(spacing: 0) {
             ForEach(AppStyle.ingredientColors.indices, id: \.self) { index in
                 Button {
                     selectedIndex = index
                 } label: {
                     Circle()
                         .fill(AppStyle.color(for: index))
-                        .frame(width: 39, height: 39)
+                        .frame(width: 36, height: 36)
                         .overlay(
                             Circle().stroke(
-                                selectedIndex == index ? Color.black.opacity(0.75) : Color.black.opacity(0.25),
-                                lineWidth: selectedIndex == index ? 1.3 : 0.6
+                                selectedIndex == index ? Color.black.opacity(0.85) : Color.black.opacity(0.25),
+                                lineWidth: selectedIndex == index ? 1.4 : 0.6
                             )
                         )
+                        .frame(maxWidth: .infinity)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Farbe \(index + 1)")
             }
         }
         .frame(maxWidth: .infinity)
+        .frame(height: 40)
     }
 }
 
@@ -464,10 +920,11 @@ struct HomeView: View {
         guard !searchText.isEmpty else { return [] }
         return store.recipes.filter {
             $0.title.localizedCaseInsensitiveContains(searchText) ||
-            $0.category.localizedCaseInsensitiveContains(searchText) ||
+            store.categories(forRecipeID: $0.id).contains(where: { $0.localizedCaseInsensitiveContains(searchText) }) ||
             $0.ingredients.contains(where: {
                 $0.name.localizedCaseInsensitiveContains(searchText) ||
-                $0.amount.localizedCaseInsensitiveContains(searchText)
+                $0.amount.localizedCaseInsensitiveContains(searchText) ||
+                $0.modifier.localizedCaseInsensitiveContains(searchText)
             }) ||
             $0.instructions.contains(where: { $0.localizedCaseInsensitiveContains(searchText) })
         }
@@ -557,15 +1014,19 @@ struct RecipeBookView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var isSearching = false
     @State private var searchText = ""
-    @State private var showingAddCategory = false
-    @State private var newCategoryName = ""
+    @State private var showingCategoryEditor = false
+    @State private var editingCategory: String?
 
     private var searchResults: [Recipe] {
         guard !searchText.isEmpty else { return [] }
         return store.recipes.filter {
             $0.title.localizedCaseInsensitiveContains(searchText) ||
-            $0.category.localizedCaseInsensitiveContains(searchText) ||
-            $0.ingredients.contains(where: { $0.name.localizedCaseInsensitiveContains(searchText) }) ||
+            store.categories(forRecipeID: $0.id).contains(where: { $0.localizedCaseInsensitiveContains(searchText) }) ||
+            $0.ingredients.contains(where: {
+                $0.name.localizedCaseInsensitiveContains(searchText) ||
+                $0.amount.localizedCaseInsensitiveContains(searchText) ||
+                $0.modifier.localizedCaseInsensitiveContains(searchText)
+            }) ||
             $0.instructions.contains(where: { $0.localizedCaseInsensitiveContains(searchText) })
         }
     }
@@ -601,9 +1062,18 @@ struct RecipeBookView: View {
                             NavigationLink {
                                 CategoryRecipesView(category: category)
                             } label: {
-                                OutlinePill(title: category)
+                                OutlinePill(
+                                    title: category,
+                                    fillColor: AppStyle.color(for: store.categoryColorIndex(for: category))
+                                )
                             }
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                Button("Kategorie bearbeiten", systemImage: "pencil") {
+                                    editingCategory = category
+                                    showingCategoryEditor = true
+                                }
+                            }
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -617,19 +1087,19 @@ struct RecipeBookView: View {
         .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
             if !isSearching {
                 OrangeCircleButton(symbol: "plus", size: 60) {
-                    newCategoryName = ""
-                    showingAddCategory = true
+                    editingCategory = nil
+                    showingCategoryEditor = true
                 }
                 .padding(.trailing, 20)
                 .padding(.bottom, 18)
             }
         }
-        .alert("Neue Kategorie", isPresented: $showingAddCategory) {
-            TextField("Name der Kategorie", text: $newCategoryName)
-            Button("Hinzufügen") { store.addCategory(newCategoryName) }
-            Button("Abbrechen", role: .cancel) { }
-        } message: {
-            Text("Gib deiner neuen Kategorie einen Namen.")
+        .sheet(isPresented: $showingCategoryEditor) {
+            CategoryEditorView(existingCategory: editingCategory)
+                .environmentObject(store)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.hidden)
+                .presentationBackground(.white)
         }
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
@@ -664,6 +1134,420 @@ struct RecipeBookView: View {
     }
 }
 
+// MARK: - Category create / edit
+
+struct CategoryEditorView: View {
+    @EnvironmentObject private var store: RecipeStore
+    @Environment(\.dismiss) private var dismiss
+
+    let existingCategory: String?
+    @State private var title: String
+    @State private var selectedColorIndex: Int = AppStyle.whiteColorIndex
+    @State private var selectedRecipeIDs: Set<UUID> = []
+    @State private var showingRecipeSelection = false
+    @State private var showingDeleteConfirmation = false
+    @State private var showingDuplicateAlert = false
+
+    init(existingCategory: String? = nil) {
+        self.existingCategory = existingCategory
+        _title = State(initialValue: existingCategory ?? "")
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(existingCategory == nil ? "Neue Kategorie" : "Kategorie bearbeiten")
+                    .font(AppStyle.heading())
+                Spacer()
+                CircleIconButton(symbol: "xmark") { dismiss() }
+            }
+            .padding(.top, 22)
+
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 26) {
+                    TextField("Titel", text: $title)
+                        .font(.system(size: 19, design: .monospaced))
+                        .padding(.horizontal, 14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(height: 40)
+                        .overlay(Capsule().stroke(AppStyle.line, lineWidth: 0.8))
+                        .padding(.top, 20)
+
+                    IngredientColorPicker(selectedIndex: $selectedColorIndex)
+                        .padding(.top, 320)
+
+                    Button {
+                        showingRecipeSelection = true
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text("Rezepte hinzufügen")
+                            if !selectedRecipeIDs.isEmpty {
+                                Text("(\(selectedRecipeIDs.count))")
+                                    .foregroundStyle(.black.opacity(0.55))
+                            }
+                        }
+                        .font(.system(size: 18, design: .monospaced))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(.white, in: Capsule())
+                        .overlay(Capsule().stroke(AppStyle.line, lineWidth: 0.8))
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 18)
+                    .padding(.bottom, 20)
+
+                    if existingCategory != nil {
+                        Button(role: .destructive) {
+                            showingDeleteConfirmation = true
+                        } label: {
+                            Label("Kategorie löschen", systemImage: "trash")
+                                .font(.system(size: 15, design: .monospaced))
+                                .foregroundStyle(.red.opacity(0.85))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .overlay(Capsule().stroke(.red.opacity(0.45), lineWidth: 0.8))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.bottom, 16)
+                    }
+                }
+            }
+
+            OrangeCircleButton(symbol: "checkmark", size: 60) {
+                saveCategory()
+            }
+            .padding(.top, 10)
+            .padding(.bottom, 14)
+        }
+        .padding(.horizontal, AppStyle.horizontalPadding)
+        .background(.white)
+        .onAppear {
+            if let existingCategory {
+                selectedColorIndex = store.categoryColorIndex(for: existingCategory)
+                selectedRecipeIDs = store.recipeIDs(forCategory: existingCategory)
+            }
+        }
+        .sheet(isPresented: $showingRecipeSelection) {
+            RecipeSelectionSheet(
+                selectedRecipeIDs: selectedRecipeIDs,
+                categoryColorIndex: selectedColorIndex
+            ) { ids in
+                selectedRecipeIDs = ids
+            }
+            .environmentObject(store)
+            .presentationDetents([.large])
+            .presentationDragIndicator(.hidden)
+            .presentationBackground(.white)
+        }
+        .alert("Kategorie existiert bereits", isPresented: $showingDuplicateAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Bitte wähle einen anderen Namen.")
+        }
+        .confirmationDialog("Kategorie löschen?", isPresented: $showingDeleteConfirmation, titleVisibility: .visible) {
+            Button("Kategorie endgültig löschen", role: .destructive) {
+                if let existingCategory {
+                    store.deleteCategory(existingCategory)
+                }
+                dismiss()
+            }
+            Button("Abbrechen", role: .cancel) { }
+        } message: {
+            Text("Die Rezepte selbst bleiben erhalten.")
+        }
+    }
+
+    private func saveCategory() {
+        let cleanedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedTitle.isEmpty else { return }
+
+        if let existingCategory {
+            let saved = store.updateCategory(
+                oldName: existingCategory,
+                newName: cleanedTitle,
+                colorIndex: selectedColorIndex,
+                recipeIDs: selectedRecipeIDs
+            )
+            if !saved {
+                showingDuplicateAlert = true
+                return
+            }
+        } else {
+            let duplicate = store.categories.contains {
+                $0.localizedCaseInsensitiveCompare(cleanedTitle) == .orderedSame
+            }
+            guard !duplicate else {
+                showingDuplicateAlert = true
+                return
+            }
+            store.addCategory(cleanedTitle, colorIndex: selectedColorIndex, recipeIDs: selectedRecipeIDs)
+        }
+        dismiss()
+    }
+}
+
+// MARK: - Select recipes for a category
+
+struct RecipeSelectionSheet: View {
+    @EnvironmentObject private var store: RecipeStore
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var selectedRecipeIDs: Set<UUID>
+    let categoryColorIndex: Int
+    let onSave: (Set<UUID>) -> Void
+
+    init(
+        selectedRecipeIDs: Set<UUID>,
+        categoryColorIndex: Int,
+        onSave: @escaping (Set<UUID>) -> Void
+    ) {
+        _selectedRecipeIDs = State(initialValue: selectedRecipeIDs)
+        self.categoryColorIndex = categoryColorIndex
+        self.onSave = onSave
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Alle Rezepte")
+                    .font(AppStyle.heading())
+                Spacer()
+                CircleIconButton(symbol: "xmark") { dismiss() }
+            }
+            .padding(.top, 22)
+
+            ScrollView(showsIndicators: false) {
+                LazyVStack(spacing: 12) {
+                    ForEach(store.recipes) { recipe in
+                        Button {
+                            toggle(recipe.id)
+                        } label: {
+                            ZStack(alignment: .bottomTrailing) {
+                                RecipeRow(recipe: recipe)
+                                selectionDot(isSelected: selectedRecipeIDs.contains(recipe.id))
+                                    .padding(9)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.top, 20)
+                .padding(.bottom, 24)
+            }
+
+            OrangeCircleButton(symbol: "checkmark", size: 60) {
+                onSave(selectedRecipeIDs)
+                dismiss()
+            }
+            .padding(.top, 8)
+            .padding(.bottom, 14)
+        }
+        .padding(.horizontal, AppStyle.horizontalPadding)
+        .background(.white)
+    }
+
+    private func toggle(_ id: UUID) {
+        if selectedRecipeIDs.contains(id) {
+            selectedRecipeIDs.remove(id)
+        } else {
+            selectedRecipeIDs.insert(id)
+        }
+    }
+
+    private func selectionDot(isSelected: Bool) -> some View {
+        Circle()
+            .fill(isSelected
+                  ? (categoryColorIndex == AppStyle.whiteColorIndex
+                     ? Color.black.opacity(0.20)
+                     : AppStyle.color(for: categoryColorIndex))
+                  : .white)
+            .frame(width: 21, height: 21)
+            .overlay(Circle().stroke(AppStyle.line, lineWidth: 0.8))
+    }
+}
+
+// MARK: - Ingredient catalog create / edit
+
+struct IngredientDefinitionEditorView: View {
+    @EnvironmentObject private var store: RecipeStore
+    @Environment(\.dismiss) private var dismiss
+
+    let existingName: String?
+    @State private var name: String
+    @State private var quantitySuggestionsText = ""
+    @State private var unitSuggestionsText = ""
+    @State private var modifiersText = ""
+    @State private var selectedColorIndex = AppStyle.whiteColorIndex
+    @State private var showingDuplicateAlert = false
+    @State private var showingDeleteConfirmation = false
+
+    init(existingName: String? = nil) {
+        self.existingName = existingName
+        _name = State(initialValue: existingName ?? "")
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(existingName == nil ? "Neue Zutat" : "Zutat bearbeiten")
+                    .font(AppStyle.heading())
+                Spacer()
+                CircleIconButton(symbol: "xmark") { dismiss() }
+            }
+            .padding(.top, 22)
+
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 20) {
+                    TextField("Name der Zutat", text: $name)
+                        .font(.system(size: 19, design: .monospaced))
+                        .padding(.horizontal, 14)
+                        .frame(height: 42)
+                        .overlay(Capsule().stroke(AppStyle.line, lineWidth: 0.8))
+                        .padding(.top, 20)
+
+                    Text("Mengenvorschläge")
+                        .font(.system(size: 18, design: .monospaced))
+                    TextEditor(text: $quantitySuggestionsText)
+                        .font(.system(size: 15, design: .monospaced))
+                        .frame(minHeight: 72)
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(AppStyle.line, lineWidth: 0.8))
+                    Text("Werte mit Komma oder Zeilenumbruch trennen, z. B. 50, 100, 250, 500.")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.black.opacity(0.55))
+                        .padding(.top, -14)
+
+                    Text("Einheiten")
+                        .font(.system(size: 18, design: .monospaced))
+                    TextEditor(text: $unitSuggestionsText)
+                        .font(.system(size: 15, design: .monospaced))
+                        .frame(minHeight: 58)
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(AppStyle.line, lineWidth: 0.8))
+                    Text("Einheiten mit Komma oder Zeilenumbruch trennen, z. B. g, kg, EL.")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.black.opacity(0.55))
+                        .padding(.top, -14)
+
+                    Text("Zusätze / Varianten")
+                        .font(.system(size: 18, design: .monospaced))
+                    TextEditor(text: $modifiersText)
+                        .font(.system(size: 16, design: .monospaced))
+                        .frame(minHeight: 110)
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(AppStyle.line, lineWidth: 0.8))
+                    Text("Ein Zusatz pro Zeile, z. B. gemahlen, gehackt oder gehobelt.")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.black.opacity(0.55))
+                        .padding(.top, -14)
+
+                    Text("Standardfarbe")
+                        .font(.system(size: 18, design: .monospaced))
+                    IngredientColorPicker(selectedIndex: $selectedColorIndex)
+
+                    if existingName != nil {
+                        Button(role: .destructive) {
+                            showingDeleteConfirmation = true
+                        } label: {
+                            Label("Zutat aus der Liste entfernen", systemImage: "trash")
+                                .font(.system(size: 15, design: .monospaced))
+                                .foregroundStyle(.red.opacity(0.85))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .overlay(Capsule().stroke(.red.opacity(0.45), lineWidth: 0.8))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 10)
+                    }
+                }
+            }
+
+            OrangeCircleButton(symbol: "checkmark", size: 60) {
+                saveIngredient()
+            }
+            .padding(.top, 10)
+            .padding(.bottom, 14)
+        }
+        .padding(.horizontal, AppStyle.horizontalPadding)
+        .background(.white)
+        .onAppear {
+            if let existingName {
+                quantitySuggestionsText = store.quantitySuggestions(forIngredient: existingName).joined(separator: ", ")
+                unitSuggestionsText = store.unitSuggestions(forIngredient: existingName).joined(separator: ", ")
+                modifiersText = store.modifiers(forIngredient: existingName).joined(separator: "\n")
+                selectedColorIndex = store.ingredientColorIndex(for: existingName)
+            } else {
+                quantitySuggestionsText = IngredientCatalog.fallbackQuantitySuggestions.joined(separator: ", ")
+                unitSuggestionsText = IngredientCatalog.fallbackUnitSuggestions.joined(separator: ", ")
+            }
+        }
+        .alert("Zutat existiert bereits", isPresented: $showingDuplicateAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Bitte wähle einen anderen Namen.")
+        }
+        .confirmationDialog("Zutat entfernen?", isPresented: $showingDeleteConfirmation, titleVisibility: .visible) {
+            Button("Zutat entfernen", role: .destructive) {
+                if let existingName { store.deleteIngredient(existingName) }
+                dismiss()
+            }
+            Button("Abbrechen", role: .cancel) { }
+        } message: {
+            Text("Bereits gespeicherte Rezepte behalten diese Zutat.")
+        }
+    }
+
+    private func saveIngredient() {
+        let cleanedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedName.isEmpty else { return }
+        let quantities = parseSuggestionList(quantitySuggestionsText)
+        let units = parseSuggestionList(unitSuggestionsText)
+        let modifiers = parseSuggestionList(modifiersText)
+
+        if let existingName {
+            let saved = store.updateIngredient(
+                oldName: existingName,
+                newName: cleanedName,
+                quantitySuggestions: quantities,
+                unitSuggestions: units,
+                modifiers: modifiers,
+                colorIndex: selectedColorIndex
+            )
+            guard saved else {
+                showingDuplicateAlert = true
+                return
+            }
+        } else {
+            let duplicate = store.ingredientCatalog.contains {
+                $0.localizedCaseInsensitiveCompare(cleanedName) == .orderedSame
+            }
+            guard !duplicate else {
+                showingDuplicateAlert = true
+                return
+            }
+            store.addIngredient(
+                cleanedName,
+                quantitySuggestions: quantities,
+                unitSuggestions: units,
+                modifiers: modifiers,
+                colorIndex: selectedColorIndex
+            )
+        }
+        dismiss()
+    }
+
+    private func parseSuggestionList(_ text: String) -> [String] {
+        text.components(separatedBy: CharacterSet(charactersIn: ",\n"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+}
+
 // MARK: - Category results
 
 struct CategoryRecipesView: View {
@@ -672,7 +1556,7 @@ struct CategoryRecipesView: View {
     @Environment(\.dismiss) private var dismiss
 
     private var recipes: [Recipe] {
-        store.recipes.filter { $0.category == category }
+        store.recipes(inCategory: category)
     }
 
     var body: some View {
@@ -712,9 +1596,22 @@ struct CategoryRecipesView: View {
         }
         .padding(.horizontal, AppStyle.horizontalPadding)
         .background(.white)
+        .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
+            OrangeCircleButton(symbol: "plus", size: 60) {
+                // The form receives the current category as its initial selection.
+                showingNewRecipe = true
+            }
+            .padding(.trailing, 20)
+            .padding(.bottom, 18)
+        }
+        .navigationDestination(isPresented: $showingNewRecipe) {
+            RecipeFormView(initialCategory: category)
+        }
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
     }
+
+    @State private var showingNewRecipe = false
 }
 
 // MARK: - Screen 02: create / edit recipe
@@ -732,15 +1629,16 @@ struct RecipeFormView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var imageData: Data?
     @State private var showingTitleAlert = false
+    @State private var showingDeleteConfirmation = false
     @State private var showingIngredientPicker = false
     @FocusState private var titleFieldFocused: Bool
 
-    init(existingRecipe: Recipe? = nil) {
+    init(existingRecipe: Recipe? = nil, initialCategory: String? = nil) {
         self.existingRecipe = existingRecipe
         _title = State(initialValue: existingRecipe?.title ?? "")
         _selectedIngredients = State(initialValue: existingRecipe?.ingredients ?? [])
         _instructionFields = State(initialValue: existingRecipe?.instructions ?? [])
-        _selectedCategory = State(initialValue: existingRecipe?.category ?? "")
+        _selectedCategory = State(initialValue: existingRecipe?.category ?? initialCategory ?? "")
         _imageData = State(initialValue: existingRecipe?.imageData)
     }
 
@@ -772,6 +1670,12 @@ struct RecipeFormView: View {
                     instructionsSection
                     categoryPicker
                         .padding(.bottom, 10)
+
+                    if existingRecipe != nil {
+                        deleteRecipeButton
+                            .padding(.top, 8)
+                            .padding(.bottom, 28)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -809,8 +1713,40 @@ struct RecipeFormView: View {
         } message: {
             Text("Bitte gib deinem Rezept zuerst einen Titel.")
         }
+        .confirmationDialog("Rezept löschen?", isPresented: $showingDeleteConfirmation, titleVisibility: .visible) {
+            Button("Rezept endgültig löschen", role: .destructive) {
+                deleteRecipe()
+            }
+            Button("Abbrechen", role: .cancel) { }
+        } message: {
+            Text("Dieses Rezept wird dauerhaft aus deinem Backbuch entfernt.")
+        }
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
+    }
+
+    private var deleteRecipeButton: some View {
+        Button(role: .destructive) {
+            showingDeleteConfirmation = true
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: "trash")
+                Text("Rezept löschen")
+            }
+            .font(.system(size: 16, design: .monospaced))
+            .foregroundStyle(Color.red.opacity(0.85))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 13)
+            .background(.white, in: Capsule())
+            .overlay(Capsule().stroke(Color.red.opacity(0.55), lineWidth: 0.8))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func deleteRecipe() {
+        guard let existingRecipe else { return }
+        store.deleteRecipe(id: existingRecipe.id)
+        dismiss()
     }
 
     private var photoPicker: some View {
@@ -987,8 +1923,8 @@ struct IngredientPickerView: View {
 
     @State private var isSearching = false
     @State private var searchText = ""
-    @State private var showingAddIngredient = false
-    @State private var newIngredientName = ""
+    @State private var showingIngredientEditor = false
+    @State private var editingIngredient: String?
     @State private var path: [String] = []
 
     private var filteredIngredients: [String] {
@@ -1015,8 +1951,8 @@ struct IngredientPickerView: View {
                     }
 
                     CircleIconButton(symbol: "plus") {
-                        newIngredientName = ""
-                        showingAddIngredient = true
+                        editingIngredient = nil
+                        showingIngredientEditor = true
                     }
 
                     CircleIconButton(symbol: "xmark") { dismiss() }
@@ -1034,10 +1970,16 @@ struct IngredientPickerView: View {
                             NavigationLink(value: name) {
                                 SmallOutlinePill(
                                     title: name,
-                                    fillColor: isSelected(name) ? Color.black.opacity(0.17) : .white
+                                    fillColor: ingredientChipColor(for: name)
                                 )
                             }
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                Button("Zutat bearbeiten", systemImage: "pencil") {
+                                    editingIngredient = name
+                                    showingIngredientEditor = true
+                                }
+                            }
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1073,12 +2015,12 @@ struct IngredientPickerView: View {
                     }
                 }
             }
-            .alert("Neue Zutat", isPresented: $showingAddIngredient) {
-                TextField("Name der Zutat", text: $newIngredientName)
-                Button("Hinzufügen") { store.addIngredient(newIngredientName) }
-                Button("Abbrechen", role: .cancel) { }
-            } message: {
-                Text("Die Zutat wird dauerhaft in deiner Zutatenliste gespeichert.")
+            .sheet(isPresented: $showingIngredientEditor) {
+                IngredientDefinitionEditorView(existingName: editingIngredient)
+                    .environmentObject(store)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.hidden)
+                    .presentationBackground(.white)
             }
             .navigationBarBackButtonHidden(true)
             .toolbar(.hidden, for: .navigationBar)
@@ -1091,9 +2033,19 @@ struct IngredientPickerView: View {
             $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
         }
     }
+
+    private func ingredientChipColor(for name: String) -> Color {
+        guard isSelected(name) else { return .white }
+        let index = selectedIngredients.first(where: {
+            $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+        })?.colorIndex ?? store.ingredientColorIndex(for: name)
+        return index == AppStyle.whiteColorIndex
+            ? Color.black.opacity(0.15)
+            : AppStyle.color(for: index).opacity(0.72)
+    }
 }
 
-// MARK: - Ingredient amount and color screen (Zutaten_02.png)
+// MARK: - Ingredient amount, unit and optional modifier
 
 struct IngredientAmountView: View {
     let name: String
@@ -1101,9 +2053,20 @@ struct IngredientAmountView: View {
     let onSave: (RecipeIngredient) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var amount: String
+    @EnvironmentObject private var store: RecipeStore
+    @State private var quantity: String
+    @State private var unit: String
+    @State private var modifier: String
     @State private var selectedColorIndex: Int
     @State private var showingManualEntry = false
+
+    private var quantitySuggestions: [String] {
+        store.quantitySuggestions(forIngredient: name)
+    }
+
+    private var unitSuggestions: [String] {
+        store.unitSuggestions(forIngredient: name)
+    }
 
     init(
         name: String,
@@ -1113,87 +2076,50 @@ struct IngredientAmountView: View {
         self.name = name
         self.existingIngredient = existingIngredient
         self.onSave = onSave
-        _amount = State(initialValue: existingIngredient?.amount ?? "")
-        _selectedColorIndex = State(initialValue: existingIngredient?.colorIndex ?? 1)
+        _quantity = State(initialValue: existingIngredient?.quantity ?? "")
+        _unit = State(initialValue: existingIngredient?.unit ?? "")
+        _modifier = State(initialValue: existingIngredient?.modifier ?? "")
+        _selectedColorIndex = State(initialValue: existingIngredient?.colorIndex ?? AppStyle.whiteColorIndex)
     }
 
-    private let amountSuggestions = ["500 g", "450 g", "250 g", "125 g", "100 g", "300 g", "50 g", "1 kg"]
-    private let flourTypeSuggestions = ["t 405", "t 550", "t 1050"]
-    private let standardSuggestions = ["50 g", "100 g", "125 g", "250 g", "500 g", "1 kg", "1 EL", "1 TL"]
-
-    private var isFlour: Bool {
-        name.localizedCaseInsensitiveCompare("Mehl") == .orderedSame
+    private var modifierSuggestions: [String] {
+        store.modifiers(forIngredient: name)
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("Zutaten")
-                    .font(AppStyle.heading())
-                    .foregroundStyle(.black)
-                Spacer()
-                CircleIconButton(symbol: "xmark") { dismiss() }
-            }
-            .padding(.top, 22)
+            header
 
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 0) {
-                    SmallOutlinePill(
-                        title: name,
-                        fillColor: AppStyle.color(for: selectedColorIndex).opacity(0.55)
-                    )
-                    .padding(.top, 20)
-
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), alignment: .leading), count: 3), alignment: .leading, spacing: 18) {
-                        ForEach(isFlour ? amountSuggestions : standardSuggestions, id: \.self) { suggestion in
-                            suggestionButton(suggestion)
-                        }
-                    }
-                    .padding(.top, 22)
-
-                    if isFlour {
-                        HStack(spacing: 10) {
-                            ForEach(flourTypeSuggestions, id: \.self) { suggestion in
-                                suggestionButton(suggestion)
-                            }
-                        }
-                        .padding(.top, 76)
-                    } else {
-                        Spacer(minLength: 75)
-                    }
-
+                VStack(alignment: .leading, spacing: 24) {
+                    ingredientNamePill
+                    quantitySection
+                    unitSection
+                    modifierSection
                     IngredientColorPicker(selectedIndex: $selectedColorIndex)
-                        .padding(.top, isFlour ? 78 : 70)
-
-                    Button {
-                        showingManualEntry = true
-                    } label: {
-                        SmallOutlinePill(title: "Eingabe")
-                    }
-                    .buttonStyle(.plain)
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 78)
-                    .padding(.bottom, 30)
+                        .padding(.top, 4)
+                    manualEntryButton
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            OrangeCircleButton(symbol: "checkmark", size: 60) {
-                onSave(RecipeIngredient(
-                    id: existingIngredient?.id ?? UUID(),
-                    name: name,
-                    amount: amount.trimmingCharacters(in: .whitespacesAndNewlines),
-                    colorIndex: selectedColorIndex
-                ))
-                dismiss()
-            }
-            .padding(.top, 10)
-            .padding(.bottom, 14)
+            saveButton
         }
         .padding(.horizontal, AppStyle.horizontalPadding)
         .background(.white)
+        .onAppear {
+            if existingIngredient == nil {
+                selectedColorIndex = store.ingredientColorIndex(for: name)
+            }
+        }
         .sheet(isPresented: $showingManualEntry) {
-            ManualQuantitySheet(initialValue: amount, initialColorIndex: selectedColorIndex) { newAmount, newColor in
-                amount = newAmount
+            ManualQuantitySheet(
+                initialQuantity: quantity,
+                initialUnit: unit,
+                initialColorIndex: selectedColorIndex
+            ) { newQuantity, newUnit, newColor in
+                quantity = newQuantity
+                unit = newUnit
                 selectedColorIndex = newColor
             }
             .presentationDetents([.height(500)])
@@ -1205,25 +2131,144 @@ struct IngredientAmountView: View {
         .toolbar(.hidden, for: .navigationBar)
     }
 
-    private func suggestionButton(_ suggestion: String) -> some View {
-        let isSelected = amount == suggestion
-        let fillColor = isSelected
-            ? AppStyle.color(for: selectedColorIndex).opacity(0.78)
-            : Color.white
+    private var header: some View {
+        HStack {
+            Text("Zutaten")
+                .font(AppStyle.heading())
+                .foregroundStyle(.black)
+            Spacer()
+            CircleIconButton(symbol: "xmark") { dismiss() }
+        }
+        .padding(.top, 22)
+    }
 
+    private var ingredientNamePill: some View {
+        SmallOutlinePill(
+            title: name,
+            fillColor: AppStyle.color(for: selectedColorIndex).opacity(0.55)
+        )
+        .padding(.top, 20)
+    }
+
+    private var quantitySection: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text("Menge")
+                .font(.system(size: 19, design: .monospaced))
+            LeftAlignedFlowLayout(horizontalSpacing: 10, verticalSpacing: 12) {
+                ForEach(quantitySuggestions, id: \.self) { value in
+                    quantityButton(value)
+                }
+            }
+        }
+    }
+
+    private func quantityButton(_ value: String) -> some View {
+        let isSelected = quantity == value
+        // Ausgewählte Vorschläge werden neutral hellgrau markiert.
+        // Die gewählte Zutatenfarbe betrifft nur den gespeicherten Zutaten-Chip.
+        let buttonColor = isSelected ? Color.black.opacity(0.14) : Color.white
         return Button {
-            amount = suggestion
+            quantity = value
         } label: {
-            SmallOutlinePill(title: suggestion, fillColor: fillColor)
+            SmallOutlinePill(title: value, fillColor: buttonColor)
         }
         .buttonStyle(.plain)
+    }
+
+    private var unitSection: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text("Einheit")
+                .font(.system(size: 19, design: .monospaced))
+            LeftAlignedFlowLayout(horizontalSpacing: 10, verticalSpacing: 12) {
+                ForEach(unitSuggestions, id: \.self) { value in
+                    unitButton(value)
+                }
+            }
+        }
+    }
+
+    private func unitButton(_ value: String) -> some View {
+        let isSelected = unit == value
+        // Ausgewählte Vorschläge werden neutral hellgrau markiert.
+        // Die gewählte Zutatenfarbe betrifft nur den gespeicherten Zutaten-Chip.
+        let buttonColor = isSelected ? Color.black.opacity(0.14) : Color.white
+        return Button {
+            unit = value
+        } label: {
+            SmallOutlinePill(title: value, fillColor: buttonColor)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var modifierSection: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text("Zusatz (optional)")
+                .font(.system(size: 19, design: .monospaced))
+
+            if !modifierSuggestions.isEmpty {
+                LeftAlignedFlowLayout(horizontalSpacing: 10, verticalSpacing: 12) {
+                    ForEach(modifierSuggestions, id: \.self) { value in
+                        modifierButton(value)
+                    }
+                }
+            }
+
+            TextField("Eigener Zusatz, z. B. fein gehackt", text: $modifier)
+                .font(.system(size: 15, design: .monospaced))
+                .padding(.horizontal, 14)
+                .frame(height: 42)
+                .background(.white, in: Capsule())
+                .overlay(Capsule().stroke(AppStyle.line, lineWidth: 0.8))
+        }
+    }
+
+    private func modifierButton(_ value: String) -> some View {
+        let isSelected = modifier == value
+        // Ausgewählte Vorschläge werden neutral hellgrau markiert.
+        // Die gewählte Zutatenfarbe betrifft nur den gespeicherten Zutaten-Chip.
+        let buttonColor = isSelected ? Color.black.opacity(0.14) : Color.white
+        return Button {
+            modifier = isSelected ? "" : value
+        } label: {
+            SmallOutlinePill(title: value, fillColor: buttonColor)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var manualEntryButton: some View {
+        Button {
+            showingManualEntry = true
+        } label: {
+            SmallOutlinePill(title: "Eingabe")
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 6)
+        .padding(.bottom, 20)
+    }
+
+    private var saveButton: some View {
+        OrangeCircleButton(symbol: "checkmark", size: 60) {
+            let ingredient = RecipeIngredient(
+                id: existingIngredient?.id ?? UUID(),
+                name: name,
+                quantity: quantity.trimmingCharacters(in: .whitespacesAndNewlines),
+                unit: unit,
+                modifier: modifier.trimmingCharacters(in: .whitespacesAndNewlines),
+                colorIndex: selectedColorIndex
+            )
+            onSave(ingredient)
+            dismiss()
+        }
+        .padding(.top, 10)
+        .padding(.bottom, 14)
     }
 }
 
 // MARK: - Manual amount/unit overlay (Zutaten_Eingabe.png)
 
 struct ManualQuantitySheet: View {
-    let onConfirm: (String, Int) -> Void
+    let onConfirm: (String, String, Int) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var quantity: String
@@ -1231,19 +2276,23 @@ struct ManualQuantitySheet: View {
     @State private var selectedColorIndex: Int
     @FocusState private var quantityFocused: Bool
 
-    private let units = ["g", "kg", "ml", "l", "el", "tl", "msp", "stck", "pck", "prise"]
+    private let units = ["g", "kg", "ml", "l", "EL", "TL", "Msp", "Stück", "Pck", "Prise"]
 
-    init(initialValue: String, initialColorIndex: Int, onConfirm: @escaping (String, Int) -> Void) {
-        let parsed = Self.parseAmount(initialValue)
+    init(
+        initialQuantity: String,
+        initialUnit: String,
+        initialColorIndex: Int,
+        onConfirm: @escaping (String, String, Int) -> Void
+    ) {
         self.onConfirm = onConfirm
-        _quantity = State(initialValue: parsed.quantity)
-        _selectedUnit = State(initialValue: parsed.unit)
+        _quantity = State(initialValue: initialQuantity)
+        _selectedUnit = State(initialValue: initialUnit)
         _selectedColorIndex = State(initialValue: initialColorIndex)
     }
 
     var body: some View {
         VStack(spacing: 20) {
-            TextField("Eingabe", text: $quantity)
+            TextField("Menge", text: $quantity)
                 .font(.system(size: 21, design: .monospaced))
                 .multilineTextAlignment(.center)
                 .keyboardType(.decimalPad)
@@ -1254,38 +2303,36 @@ struct ManualQuantitySheet: View {
                 .overlay(Capsule().stroke(AppStyle.line, lineWidth: 0.8))
                 .padding(.top, 18)
 
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 5), spacing: 14) {
-                ForEach(units, id: \.self) { unit in
-                    Button {
-                        selectedUnit = unit
-                    } label: {
-                        SmallOutlinePill(
-                            title: unit,
-                            fillColor: selectedUnit == unit ? Color.black.opacity(0.13) : .white
-                        )
-                        .frame(maxWidth: .infinity)
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Einheit")
+                    .font(.system(size: 18, design: .monospaced))
+                LeftAlignedFlowLayout(horizontalSpacing: 10, verticalSpacing: 12) {
+                    ForEach(units, id: \.self) { unit in
+                        Button {
+                            selectedUnit = unit
+                        } label: {
+                            SmallOutlinePill(
+                                title: unit,
+                                fillColor: selectedUnit == unit
+                                    ? Color.black.opacity(0.14)
+                                    : .white
+                            )
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             }
 
             Spacer(minLength: 12)
-
             IngredientColorPicker(selectedIndex: $selectedColorIndex)
-
             Spacer(minLength: 12)
 
             OrangeCircleButton(symbol: "checkmark", size: 60) {
-                let cleanQuantity = quantity.trimmingCharacters(in: .whitespacesAndNewlines)
-                let result: String
-                if cleanQuantity.isEmpty {
-                    result = ""
-                } else if selectedUnit.isEmpty {
-                    result = cleanQuantity
-                } else {
-                    result = "\(cleanQuantity) \(selectedUnit)"
-                }
-                onConfirm(result, selectedColorIndex)
+                onConfirm(
+                    quantity.trimmingCharacters(in: .whitespacesAndNewlines),
+                    selectedUnit,
+                    selectedColorIndex
+                )
                 dismiss()
             }
             .padding(.bottom, 14)
@@ -1296,48 +2343,6 @@ struct ManualQuantitySheet: View {
             quantityFocused = true
         }
     }
-
-    private static func parseAmount(_ value: String) -> (quantity: String, unit: String) {
-        let trimmed: String = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalized: String = trimmed.lowercased()
-
-        // Explicit type annotation keeps the SwiftUI preview compiler's
-        // type-checking work small and predictable.
-        let knownUnits: [String] = [
-            "stck",
-            "prise",
-            "msp",
-            "pck",
-            "kg",
-            "ml",
-            "el",
-            "tl",
-            "g",
-            "l"
-        ]
-
-        // Flour types such as "t 405" are labels, not measured quantities.
-        if normalized.hasPrefix("t ") {
-            let possibleNumber = normalized.dropFirst(2)
-            if !possibleNumber.isEmpty && possibleNumber.allSatisfy({ $0.isNumber }) {
-                return (trimmed, "")
-            }
-        }
-
-        for unit: String in knownUnits {
-            let suffix: String = " " + unit
-            if normalized.hasSuffix(suffix) {
-                let quantityLength = trimmed.count - suffix.count
-                if quantityLength >= 0 {
-                    let splitIndex = trimmed.index(trimmed.startIndex, offsetBy: quantityLength)
-                    let quantity = String(trimmed[..<splitIndex])
-                    return (quantity, unit)
-                }
-            }
-        }
-
-        return (trimmed, "g")
-    }
 }
 
 // MARK: - Recipe list row and detail
@@ -1346,36 +2351,40 @@ struct RecipeRow: View {
     let recipe: Recipe
 
     var body: some View {
-        HStack(spacing: 13) {
-            if let imageData = recipe.imageData, let image = UIImage(data: imageData) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 66, height: 66)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-            } else {
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(AppStyle.orange.opacity(0.75))
-                    .frame(width: 66, height: 66)
-                    .overlay(Image(systemName: "birthday.cake").font(.system(size: 23)))
+        ZStack(alignment: .bottomLeading) {
+            Group {
+                if let imageData = recipe.imageData, let image = UIImage(data: imageData) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Rectangle()
+                        .fill(AppStyle.orange.opacity(0.75))
+                        .overlay(
+                            Image(systemName: "birthday.cake")
+                                .font(.system(size: 42))
+                                .foregroundStyle(.black.opacity(0.65))
+                        )
+                }
             }
+            .frame(maxWidth: .infinity)
+            .frame(height: 220)
+            .clipped()
 
-            VStack(alignment: .leading, spacing: 5) {
-                Text(recipe.title)
-                    .font(.system(size: 18, design: .monospaced))
-                    .foregroundStyle(.black)
-                Text(recipe.category)
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(.black.opacity(0.55))
-            }
-            Spacer()
-            Image(systemName: "chevron.right")
-                .font(.system(size: 12, weight: .regular))
-                .foregroundStyle(.black.opacity(0.55))
+            Text(recipe.title)
+                .font(.system(size: 14, design: .monospaced))
+                .foregroundStyle(.black)
+                .lineLimit(1)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(.white, in: Capsule())
+                .overlay(Capsule().stroke(AppStyle.line, lineWidth: 0.7))
+                .padding(10)
         }
-        .padding(9)
-        .background(.white, in: RoundedRectangle(cornerRadius: 17))
-        .overlay(RoundedRectangle(cornerRadius: 17).stroke(AppStyle.line, lineWidth: 0.7))
+        .frame(maxWidth: .infinity)
+        .frame(height: 220)
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+        .contentShape(RoundedRectangle(cornerRadius: 20))
     }
 }
 
@@ -1422,7 +2431,15 @@ struct RecipeDetailView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                 }
 
-                SmallOutlinePill(title: currentRecipe.category)
+                LeftAlignedFlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
+                    ForEach(store.categories(forRecipeID: currentRecipe.id), id: \.self) { categoryName in
+                        SmallOutlinePill(
+                            title: categoryName,
+                            fillColor: AppStyle.color(for: store.categoryColorIndex(for: categoryName))
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 if !currentRecipe.ingredients.isEmpty {
                     Text("Zutaten")
@@ -1444,9 +2461,16 @@ struct RecipeDetailView: View {
                         .font(.system(size: 21, design: .monospaced))
                         .padding(.top, 6)
                     ForEach(Array(currentRecipe.instructions.enumerated()), id: \.offset) { index, item in
-                        Text("\(index + 1).  \(item)")
-                            .font(.system(size: 16, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 14) {
+                            Text(item)
+                                .font(.system(size: 16, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if index < currentRecipe.instructions.count - 1 {
+                                Rectangle()
+                                    .fill(AppStyle.line.opacity(0.75))
+                                    .frame(height: 0.7)
+                            }
+                        }
                     }
                 }
             }
@@ -1455,6 +2479,11 @@ struct RecipeDetailView: View {
             .padding(.bottom, 30)
         }
         .background(.white)
+        .onChange(of: store.recipes) { _, updatedRecipes in
+            if !updatedRecipes.contains(where: { $0.id == recipe.id }) {
+                dismiss()
+            }
+        }
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
     }
